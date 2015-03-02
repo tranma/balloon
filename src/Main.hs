@@ -1,5 +1,6 @@
 
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE ViewPatterns #-}
 
@@ -18,11 +19,25 @@ import Statistics.Distribution
 import Statistics.Distribution.Normal
 
 
-
-type Coord = (Double, Double)
+type Coord = (Dim, Dim)
 type ID    = Text
 type Speed = Double
-type Post  = (ID, Coord)
+
+newtype Dim = Dim Double
+  deriving (Show, Eq, Ord, Fractional)
+
+modDim s
+  = let f = floor $ abs s / limit
+    in  Dim $ signum s * (abs s - fromIntegral f * limit)
+  where limit = 600
+
+instance Num Dim where
+  (+) (Dim x) (Dim y) = modDim (x + y)
+  (-) (Dim x) (Dim y) = modDim (x - y)
+  (*) (Dim x) (Dim y) = modDim (x * y)
+  abs (Dim x)         = Dim (abs x)
+  signum (Dim x)      = Dim (signum x)
+  fromInteger i       = modDim (fromInteger i :: Double)
 
 data Direction = N | NE | E | SE | S | SW | W | NW
      deriving (Show, Eq, Enum, Bounded)
@@ -30,11 +45,27 @@ data Direction = N | NE | E | SE | S | SW | W | NW
 type Wind = (Direction, Speed)
 
 data Balloon = Balloon
-  { _location  :: Coord
+  { _coord     :: Coord
   , _temp      :: Double
   } deriving (Show)
 
 makeLenses ''Balloon
+
+data Observation = Observation
+  { _obT :: POSIXTime
+  , _obC :: Coord
+  , _obV :: Double
+  } deriving (Show)
+
+makeLenses ''Observation
+
+data Post = Post
+  { _location    :: Coord
+  , _observation :: Maybe Observation
+  } deriving (Show)
+
+makeLenses ''Post
+
 data World = World
   { _balloon :: Balloon
   , _posts   :: [Post]
@@ -44,10 +75,7 @@ data World = World
 
 makeLenses ''World
 
-type Ob = (UTCTime, Coord, Int)
-
 type WorldS = (Gen (PrimState IO), World)
-
 type WorldM = StateT WorldS IO
 
 windDirection :: Lens' World Direction
@@ -68,12 +96,13 @@ class Vary x where
 instance Vary Balloon where
   type Variant Balloon = Wind
   vary gen (direction, speed) balloon = do
+    -- temperature
     let t  = balloon ^. temp
         tD = normalDistr t 1.0 -- temperature varies by some SD
     t'    <- genContVar tD gen
-    return $ balloon & (location %~ move (direction, speed))
-                     . (temp     .~ t')
 
+    return $ balloon & (coord    %~ move (direction, speed))
+                     . (temp     .~ t')
 
 instance Vary World where
   type Variant World = ()
@@ -82,7 +111,8 @@ instance Vary World where
     -- advance time
     let t  = world ^. now
         tD = normalDistr (fromIntegral ((round t + 2) :: Int)) 2.0 -- time varies by SD 1s, skewed towards progress
-    t'    <- genContVar tD gen
+    tv    <- genContVar tD gen
+    let t' = fromRational $ toRational tv
 
     -- wind direction
     let dir   = world ^. windDirection
@@ -100,11 +130,14 @@ instance Vary World where
     -- blows the balloon
     b     <- vary gen (dir',v') (world ^. balloon)
 
-    return $ world & (now           .~ fromRational (toRational t'))
+    -- send observations!
+    let ps = send t' b (world ^. posts)
+
+    return $ world & (now           .~ t')
                    . (windDirection .~ dir')
                    . (windSpeed     .~ v')
                    . (balloon       .~ b)
-
+                   . (posts         .~ ps)
 
 -- | This might give more biases to the edge values.
 --
@@ -114,8 +147,19 @@ bound (x1,x2) y
   | y > x2    = x2
   | otherwise = y
 
+send :: POSIXTime -> Balloon -> [Post] -> [Post]
+send t b = map f
+  where f p | (p ^. location) `inRange` (b ^. coord)
+            = let ob = Observation t (b ^. coord) (b ^. temp)
+              in          p & observation .~ Just ob
+            | otherwise = p & observation .~ Nothing
+
+inRange :: Coord -> Coord -> Bool
+inRange (a,b) (x,y) = abs (a - x) < d && abs (b - y) < d
+  where d = 100
+
 move :: Wind -> Coord -> Coord
-move (d, s) (x,y) = case d of
+move (d, Dim -> s) (x,y) = case d of
   N  -> (x      , y + s)
   NE -> (x + s/2, y + s/2)
   E  -> (x + s  , y)
@@ -128,7 +172,9 @@ move (d, s) (x,y) = case d of
 defaultWorld :: World
 defaultWorld = World
   (Balloon (0,0) 10)
-  []
+  [ Post (5,7) Nothing
+  , Post (50,80) Nothing
+  , Post (360, 120) Nothing ]
   100
   (S,0)
 
