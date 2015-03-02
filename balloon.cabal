@@ -13,6 +13,9 @@ executable balloon
                      , mwc-random
                      , text
                      , time
-                     , mtl 
+                     , mtl
                      , primitive
+                     , statistics
+                     , lens
+
   default-language:    Haskell2010
