@@ -4,7 +4,9 @@
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE ViewPatterns               #-}
+{-# LANGUAGE BangPatterns #-}
 
+import           System.Environment
 import           Control.Applicative
 import           Control.Lens
 import           Control.Monad.Primitive
@@ -16,25 +18,24 @@ import           Data.ByteString.Builder        (Builder)
 import qualified Data.ByteString.Builder        as B
 import           Data.Monoid
 import           Data.Text                      (Text)
-import           Data.Thyme
+import           Data.UnixTime
 import           Statistics.Distribution
 import           Statistics.Distribution.Normal
 import qualified System.IO                      as IO
 import           System.Locale
 import           System.Random.MWC
 
+import Debug.Trace
 
 type Coord = (Dim, Dim)
 type ID    = Text
-type Speed = Double
+type Speed = Int
 
-newtype Dim = Dim Double
-  deriving (Show, Eq, Ord, Fractional)
+newtype Dim = Dim { _dim :: Int }
+  deriving (Show, Eq, Ord, Real, Enum, Integral)
 
-modDim s
-  = let f = floor $ abs s / limit
-    in  Dim $ signum s * (abs s - fromIntegral f * limit)
-  where limit = 300
+modDim x = Dim (x `mod` 300)
+{-# INLINE modDim #-}
 
 instance Num Dim where
   (+) (Dim x) (Dim y) = modDim (x + y)
@@ -42,7 +43,9 @@ instance Num Dim where
   (*) (Dim x) (Dim y) = modDim (x * y)
   abs (Dim x)         = Dim (abs x)
   signum (Dim x)      = Dim (signum x)
-  fromInteger i       = modDim (fromInteger i :: Double)
+  fromInteger i       = modDim (fromInteger i :: Int)
+
+makeLenses ''Dim
 
 data Direction = N | NE | E | SE | S | SW | W | NW
      deriving (Show, Eq, Enum, Bounded)
@@ -50,32 +53,28 @@ data Direction = N | NE | E | SE | S | SW | W | NW
 type Wind = (Direction, Speed)
 
 data Balloon = Balloon
-  { _coord :: Coord
-  , _temp  :: Double
+  { _coord :: {-# UNPACK #-} !Coord
+  , _temp  :: {-# UNPACK #-} !Int
   } deriving (Show)
 
 makeLenses ''Balloon
 
-data Observation = Observation
-  { _obT :: UTCTime
-  , _obC :: Coord
-  , _obV :: Double
+data Scale = C | F | K
+  deriving (Eq, Show)
+
+data Station = Station
+  { _location :: {-# UNPACK #-} !Coord
+  , _scale    :: {-# UNPACK #-} !Scale
+  , _name     :: ByteString
   } deriving (Show)
 
-makeLenses ''Observation
-
-data Post = Post
-  { _location    :: Coord
-  , _observation :: Maybe Observation
-  } deriving (Show)
-
-makeLenses ''Post
+makeLenses ''Station
 
 data World = World
-  { _balloon :: Balloon
-  , _posts   :: [Post]
-  , _now     :: UTCTime
-  , _wind    :: Wind
+  { _balloon :: {-# UNPACK #-} !Balloon
+  , _posts   :: {-# UNPACK #-} ![Station]
+  , _now     :: {-# UNPACK #-} !UnixTime
+  , _wind    :: {-# UNPACK #-} !Wind
   } deriving (Show)
 
 makeLenses ''World
@@ -107,10 +106,11 @@ instance Vary Balloon where
     let b = balloon & (coord %~ move (direction, speed))
     if any (inRange (b ^. coord)) stations
 
-    -- temperature
+    -- temperature, mean current value, SD 1.0
+    -- this is using a different random var to the rest to get more...randomness
     then do let t  = balloon ^. temp
-                tD = normalDistr t 1.0 -- temperature varies by some SD
-            t'    <- genContVar tD gen
+                tD = normalDistr (fromIntegral t) 1.0
+            t'    <- round <$> genContVar tD gen
             return $ b & (temp  .~ t')
     else    return   b
 
@@ -118,87 +118,89 @@ instance Vary World where
   type Variant World = ()
 
   vary gen _ world = do
-    -- advance time
-    let t      = world ^. now
-        deltaD = normalDistr 1.0 2.0 -- time varies by SD 1s, skewed towards progress
-    delta      <- genContVar deltaD gen
-    let t' = t .+^ fromSeconds delta
+    -- random delta, mean 0, SD 1
+    delta <- genContVar standard gen
 
-    -- wind direction
-    let dir   = world ^. windDirection
-        dirD  = normalDistr (fromIntegral $ fromEnum dir) 1.0
-    dir'     <- toEnum
-            <$> bound (minDirection, maxDirection)
-            <$> floor
-            <$> genContVar dirD gen
+    -- time change, mean 2, SD 10s (skewed towards progress)
+    let t  = world ^. now
+        td = delta * 10 + 2
+        t' = addUnixDiffTime t (secondsToUnixDiffTime (round td :: Int))
 
-    -- wind speed
+    -- wind direction change, mean 0, SD 1
+    let dir  = world ^. windDirection
+        dir' = bound (fromEnum dir + round delta)
+
+    -- wind speed chane, mean 0, SD 4
     let v  = world ^. windSpeed
-        vD = normalDistr v 5.0
-    v'    <- abs <$> genContVar vD gen
+        vd = delta * 4
+        v' = v + round vd
 
     -- blows the balloon
-    b <- vary gen ((dir',v'), world ^.. posts . traverse . location) (world ^. balloon)
-
-    -- send observations!
-    let ps = send t' b (world ^. posts)
+    !b <- {-# SCC "balloon-vary" #-} vary gen ((dir',v'), world ^.. posts . traverse . location) (world ^. balloon)
 
     return $ world & (now           .~ t')
                    . (windDirection .~ dir')
                    . (windSpeed     .~ v')
                    . (balloon       .~ b)
-                   . (posts         .~ ps)
 
 -- | This might give more biases to the edge values.
 --
-bound :: (Ord a) => (a,a) -> a -> a
-bound (x1,x2) y
-  | y < x1    = x1
-  | y > x2    = x2
-  | otherwise = y
-
-send :: UTCTime -> Balloon -> [Post] -> [Post]
-send t b = map f
-  where f p | (p ^. location) `inRange` (b ^. coord)
-            = let ob = Observation t (b ^. coord) (b ^. temp)
-              in          p & observation .~ Just ob
-            | otherwise = p & observation .~ Nothing
+bound :: Int -> Direction
+bound y
+  | y < fromEnum minb = minb
+  | y > fromEnum maxb = maxb
+  | otherwise = toEnum y
+  where minb = minBound :: Direction
+        maxb = maxBound :: Direction
 
 inRange :: Coord -> Coord -> Bool
-inRange (a,b) (x,y) = abs (a - x) < d && abs (b - y) < d
+inRange (Dim a,Dim b) (Dim x,Dim y) = abs (a - x) < d && abs (b - y) < d
   where d = 50
 
 move :: Wind -> Coord -> Coord
 move (d, Dim -> s) (x,y) = case d of
   N  -> (x      , y + s)
-  NE -> (x + s/2, y + s/2)
+  NE -> (x + s `div` 2, y + s `div` 2)
   E  -> (x + s  , y)
-  SE -> (x + s/2, y - s/2)
+  SE -> (x + s `div` 2, y - s `div` 2)
   S  -> (x      , y - s)
-  SW -> (x - s/2, y - s/2)
+  SW -> (x - s `div` 2, y - s `div` 2)
   W  -> (x - s  , y)
-  NW -> (x - s/2, y + s/2)
+  NW -> (x - s `div` 2, y + s `div` 2)
 
-mkLines :: World -> Builder
-mkLines w = mconcat $ map serialise (w ^.. posts . traverse . observation . traverse)
-  where serialise ob
-          = mconcat
-          [ B.stringUtf8 $ formatTime defaultTimeLocale "%Y-%m-%dT%H:%M" (ob ^. obT)
-          , sep
-          , B.doubleHexFixed (ob ^. obV)
-          , newline
-          ]
-        newline = B.char7 '\n'
-        sep     = B.char7 '|'
+convert :: Scale -> Int -> Int
+convert C = id
+convert F = round . (+20) . (*1.8) . fromIntegral
+convert K = round . (+273.15)      . fromIntegral
+
+sinkLines :: IO.Handle -> World -> IO ()
+sinkLines handle world = mapM_ observe (world ^. posts)
+  where b = world ^. balloon
+        observe station
+          = when ((b ^. coord) `inRange` (station ^. location)) $ do
+              t <- formatUnixTime "%Y-%m-%dT%H:%M:%S" (world ^. now)
+              let s = mconcat
+                      [ B.byteString t
+                      , B.char7 '|'
+                      , B.intDec (b ^. coord . _1 . dim)
+                      , B.char7 ','
+                      , B.intDec (b ^. coord . _2 . dim)
+                      , B.char7 '|'
+                      , B.intDec (convert (station ^. scale) (b ^. temp))
+                      , B.char7 '|'
+                      , B.byteString (station ^. name)
+                      , B.char7 '\n'
+                      ]
+              B.hPutBuilder handle s
 
 defaultWorld :: IO World
 defaultWorld = do
-  now <- getCurrentTime
+  now <- getUnixTime
   return $ World
     (Balloon (0,0) 10)
-    [ Post (5,7) Nothing
-    , Post (50,80) Nothing
-    , Post (360, 120) Nothing ]
+    [ Station (200,-150) C "AU"
+    , Station (-250,100) F "US"
+    , Station (-20, 120) K "FR" ]
     now
     (S,0)
 
@@ -208,18 +210,15 @@ initWorld gen = do
   world <- vary gen () w
   return (gen, world)
 
-main = do -- withSystemRandom initGo
+
+main = do
   gen   <- createSystemRandom
-  out   <- IO.openFile "foo" IO.WriteMode
+  out   <- flip IO.openFile IO.WriteMode =<< head <$> getArgs
+  IO.hSetBuffering out IO.NoBuffering
   (_,w) <- initWorld gen
-  B.hPutBuilder out (mkLines w)
+  sinkLines out w
   go out gen w
   where go out g w = do
           w' <- vary g () w
-          B.hPutBuilder out (mkLines w')
+          sinkLines out w'
           go out g w'
-          -- initGo gen = do
-             --out   <- IO.openFile "foo" IO.WriteMode
-             --(_,w) <- initWorld gen
-             --B.hPutBuilder out (mkLines w)
-             --go out gen w
