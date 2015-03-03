@@ -1,22 +1,27 @@
 
-{-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE TemplateHaskell #-}
-{-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE TemplateHaskell            #-}
+{-# LANGUAGE TypeFamilies               #-}
+{-# LANGUAGE ViewPatterns               #-}
 
--- trust me it's fine
-{-# LANGUAGE UndecidableInstances #-}
-
-import Control.Applicative
-import Control.Lens
-import Data.Text (Text)
-import System.Random.MWC
-import Control.Monad.State
-import Control.Monad.Primitive
-import Data.Time.Clock
-import Data.Time.Clock.POSIX
-import Statistics.Distribution
-import Statistics.Distribution.Normal
+import           Control.Applicative
+import           Control.Lens
+import           Control.Monad.Primitive
+import           Control.Monad.State
+import           Data.AffineSpace
+import           Data.ByteString                (ByteString)
+import qualified Data.ByteString                as B
+import           Data.ByteString.Builder        (Builder)
+import qualified Data.ByteString.Builder        as B
+import           Data.Monoid
+import           Data.Text                      (Text)
+import           Data.Thyme
+import           Statistics.Distribution
+import           Statistics.Distribution.Normal
+import qualified System.IO                      as IO
+import           System.Locale
+import           System.Random.MWC
 
 
 type Coord = (Dim, Dim)
@@ -45,14 +50,14 @@ data Direction = N | NE | E | SE | S | SW | W | NW
 type Wind = (Direction, Speed)
 
 data Balloon = Balloon
-  { _coord     :: Coord
-  , _temp      :: Double
+  { _coord :: Coord
+  , _temp  :: Double
   } deriving (Show)
 
 makeLenses ''Balloon
 
 data Observation = Observation
-  { _obT :: POSIXTime
+  { _obT :: UTCTime
   , _obC :: Coord
   , _obV :: Double
   } deriving (Show)
@@ -69,7 +74,7 @@ makeLenses ''Post
 data World = World
   { _balloon :: Balloon
   , _posts   :: [Post]
-  , _now     :: POSIXTime
+  , _now     :: UTCTime
   , _wind    :: Wind
   } deriving (Show)
 
@@ -94,25 +99,30 @@ class Vary x where
   vary :: (Functor m, PrimMonad m) => Gen (PrimState m) -> Variant x -> x -> m x
 
 instance Vary Balloon where
-  type Variant Balloon = Wind
-  vary gen (direction, speed) balloon = do
-    -- temperature
-    let t  = balloon ^. temp
-        tD = normalDistr t 1.0 -- temperature varies by some SD
-    t'    <- genContVar tD gen
+  type Variant Balloon = (Wind, [Coord])
 
-    return $ balloon & (coord    %~ move (direction, speed))
-                     . (temp     .~ t')
+  vary gen ((direction, speed), stations) balloon = do
+
+    -- coord
+    let b = balloon & (coord %~ move (direction, speed))
+    if any (inRange (b ^. coord)) stations
+
+    -- temperature
+    then do let t  = balloon ^. temp
+                tD = normalDistr t 1.0 -- temperature varies by some SD
+            t'    <- genContVar tD gen
+            return $ b & (temp  .~ t')
+    else    return   b
 
 instance Vary World where
   type Variant World = ()
 
   vary gen _ world = do
     -- advance time
-    let t  = world ^. now
-        tD = normalDistr (fromIntegral ((round t + 2) :: Int)) 2.0 -- time varies by SD 1s, skewed towards progress
-    tv    <- genContVar tD gen
-    let t' = fromRational $ toRational tv
+    let t      = world ^. now
+        deltaD = normalDistr 1.0 2.0 -- time varies by SD 1s, skewed towards progress
+    delta      <- genContVar deltaD gen
+    let t' = t .+^ fromSeconds delta
 
     -- wind direction
     let dir   = world ^. windDirection
@@ -128,7 +138,7 @@ instance Vary World where
     v'    <- abs <$> genContVar vD gen
 
     -- blows the balloon
-    b     <- vary gen (dir',v') (world ^. balloon)
+    b <- vary gen ((dir',v'), world ^.. posts . traverse . location) (world ^. balloon)
 
     -- send observations!
     let ps = send t' b (world ^. posts)
@@ -147,7 +157,7 @@ bound (x1,x2) y
   | y > x2    = x2
   | otherwise = y
 
-send :: POSIXTime -> Balloon -> [Post] -> [Post]
+send :: UTCTime -> Balloon -> [Post] -> [Post]
 send t b = map f
   where f p | (p ^. location) `inRange` (b ^. coord)
             = let ob = Observation t (b ^. coord) (b ^. temp)
@@ -169,29 +179,43 @@ move (d, Dim -> s) (x,y) = case d of
   W  -> (x - s  , y)
   NW -> (x - s/2, y + s/2)
 
-defaultWorld :: World
-defaultWorld = World
-  (Balloon (0,0) 10)
-  [ Post (5,7) Nothing
-  , Post (50,80) Nothing
-  , Post (360, 120) Nothing ]
-  100
-  (S,0)
+mkLines :: World -> Builder
+mkLines w = {-# SCC "print" #-} mconcat $ map serialise (w ^.. posts . traverse . observation . traverse)
+  where serialise ob
+          = mconcat
+          [ B.stringUtf8 $ formatTime defaultTimeLocale "%Y-%m-%dT%H:%M" (ob ^. obT)
+          , sep
+          , B.doubleHexFixed (ob ^. obV)
+          , newline
+          ]
+        newline = B.char7 '\n'
+        sep     = B.char7 '|'
+
+defaultWorld :: IO World
+defaultWorld = do
+  now <- getCurrentTime
+  return $ World
+    (Balloon (0,0) 10)
+    [ Post (5,7) Nothing
+    , Post (50,80) Nothing
+    , Post (360, 120) Nothing ]
+    now
+    (S,0)
 
 initWorld :: Gen RealWorld -> IO WorldS
 initWorld gen = do
-  world <- vary gen () defaultWorld
+  w     <- defaultWorld
+  world <- vary gen () w
   return (gen, world)
 
-main = withSystemRandom initGo
-  where go :: Gen (PrimState IO) -> World -> Int -> IO ()
-        go g w n | n > 0 = do w' <- vary g () w
-                              print w'
-                              go g w' (n-1)
-                 | otherwise = print "done"
-        initGo :: Gen (PrimState IO) -> IO ()
-        initGo g = do
-          (_,w) <- initWorld g
-          print "initial"
-          print w
-          go g w 30
+main = withSystemRandom igo
+  where go out g w = do
+          w' <- vary g () w
+          B.hPutBuilder out (mkLines w')
+          go out g w'
+        igo gen = do
+          out   <- IO.openFile "foo" IO.WriteMode
+          (_,w) <- initWorld gen
+          B.hPutBuilder out (mkLines w)
+          go out gen w
+
