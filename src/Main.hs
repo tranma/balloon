@@ -34,7 +34,7 @@ newtype Dim = Dim Double
 modDim s
   = let f = floor $ abs s / limit
     in  Dim $ signum s * (abs s - fromIntegral f * limit)
-  where limit = 600
+  where limit = 300
 
 instance Num Dim where
   (+) (Dim x) (Dim y) = modDim (x + y)
@@ -166,7 +166,7 @@ send t b = map f
 
 inRange :: Coord -> Coord -> Bool
 inRange (a,b) (x,y) = abs (a - x) < d && abs (b - y) < d
-  where d = 100
+  where d = 50
 
 move :: Wind -> Coord -> Coord
 move (d, Dim -> s) (x,y) = case d of
@@ -180,7 +180,7 @@ move (d, Dim -> s) (x,y) = case d of
   NW -> (x - s/2, y + s/2)
 
 mkLines :: World -> Builder
-mkLines w = {-# SCC "print" #-} mconcat $ map serialise (w ^.. posts . traverse . observation . traverse)
+mkLines w = mconcat $ map serialise (w ^.. posts . traverse . observation . traverse)
   where serialise ob
           = mconcat
           [ B.stringUtf8 $ formatTime defaultTimeLocale "%Y-%m-%dT%H:%M" (ob ^. obT)
@@ -208,14 +208,18 @@ initWorld gen = do
   world <- vary gen () w
   return (gen, world)
 
-main = withSystemRandom igo
+main = do -- withSystemRandom initGo
+  gen   <- createSystemRandom
+  out   <- IO.openFile "foo" IO.WriteMode
+  (_,w) <- initWorld gen
+  B.hPutBuilder out (mkLines w)
+  go out gen w
   where go out g w = do
           w' <- vary g () w
           B.hPutBuilder out (mkLines w')
           go out g w'
-        igo gen = do
-          out   <- IO.openFile "foo" IO.WriteMode
-          (_,w) <- initWorld gen
-          B.hPutBuilder out (mkLines w)
-          go out gen w
-
+          -- initGo gen = do
+             --out   <- IO.openFile "foo" IO.WriteMode
+             --(_,w) <- initWorld gen
+             --B.hPutBuilder out (mkLines w)
+             --go out gen w
