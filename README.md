@@ -2,7 +2,16 @@
 
 Balloon flying on Earth with severe climate change.
 
-## Random Generator
+## Build
+
+ - Get Haskell: one way is to get the [Haskell platform](https://www.haskell.org/platform/)
+ - `cabal build`
+
+Note that this depends on the `pipes` ecosystem.
+
+## Run
+
+### Random Generator
 
 Generate random data:
 
@@ -12,7 +21,7 @@ $ ./dist/build/random/random <number-of-seconds-you-would-like-to-wait> <output-
 
 On my 2014 MBP, this generates about 60000 lines of sample data per second.
 
-## Compute Stats
+### Compute Stats
 
 Compute some basic stats on some data.
 
@@ -36,7 +45,7 @@ running on 4 threads
 9.87s user 1.62s system 327% cpu 3.504 total
 ```
 
-## Normalisation
+### Normalisation
 
 Normalise data to desired units.
 
