@@ -1,17 +1,16 @@
 {-# LANGUAGE ParallelListComp #-}
 module Bucket where
 
-import Data.Char
-import Data.Word
-import Control.Monad
-import GHC.IO.Handle
-import qualified Foreign.Storable as F
+import           Control.Monad
+import           Data.ByteString       (ByteString)
+import qualified Data.ByteString       as B
+import           Data.Char
+import           Data.Word
 import qualified Foreign.Marshal.Alloc as F
-import System.IO
-import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
-import Pipes
-
+import qualified Foreign.Storable      as F
+import           GHC.IO.Handle
+import           Pipes
+import           System.IO
 
 data Bucket = Bucket
   { bHandle :: Handle

@@ -1,17 +1,10 @@
 {-# LANGUAGE BangPatterns               #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE MultiWayIf                 #-}
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE TemplateHaskell            #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE ViewPatterns               #-}
-{-# LANGUAGE MultiWayIf #-}
-
-module Random
-    ( WorldM, WorldS
-    , Vary(..)
-    , initWorld
-    , sinkLines
-    ) where
 
 import           Control.Applicative
 import           Control.Lens
@@ -24,9 +17,12 @@ import           Data.Monoid
 import           Data.UnixTime
 import           Statistics.Distribution
 import           Statistics.Distribution.Normal
+import           System.Environment
 import qualified System.IO                      as IO
 import           System.Random.MWC
+import           System.Timeout
 
+import           Scale
 
 type Coord = (Dim, Dim)
 type Speed = Int
@@ -54,13 +50,11 @@ data Balloon = Balloon
   } deriving (Show)
 makeLenses ''Balloon
 
-data Scale = C | F | K
-  deriving (Eq, Show)
-
 data Station = Station
   { _location :: {-# UNPACK #-} !Coord
-  , _scale    :: {-# UNPACK #-} !Scale
-  , _name     :: ByteString
+  , _tscale   ::                !Temp
+  , _dscale   ::                !Dist
+  , _name     :: {-# UNPACK #-} !ByteString
   } deriving (Show)
 makeLenses ''Station
 
@@ -70,14 +64,11 @@ data Direction = N | NE | E | SE | S | SW | W | NW
 
 data World = World
   { _balloon :: {-# UNPACK #-} !Balloon
-  , _posts   :: {-# UNPACK #-} ![Station]
+  , _posts   ::                ![Station]
   , _now     :: {-# UNPACK #-} !UnixTime
   , _wind    :: {-# UNPACK #-} !Wind
   } deriving (Show)
 makeLenses ''World
-
-type WorldS = (Gen (PrimState IO), World)
-type WorldM = StateT WorldS IO
 
 windDirection :: Lens' World Direction
 windDirection = wind . _1
@@ -100,10 +91,10 @@ instance Vary Balloon where
     let b' = b & (coord %~ move (direction, speed))
     if any (inRange (b' ^. coord)) stations
 
-    -- temperature, mean current value, SD 1.0
+    -- temperature, mean current value, SD small
     -- this is using a different random var to the rest to get more...randomness
     then do let t  = b' ^. temp
-                tD = normalDistr (fromIntegral t) 1.0
+                tD    = normalDistr (fromIntegral t) 0.4
             t'    <- round <$> genContVar tD gen
             return $ b' & (temp  .~ t')
     else    return   b'
@@ -130,7 +121,7 @@ instance Vary World where
         v' = v + round vd
 
     -- blows the balloon
-    !b <- {-# SCC "balloon-vary" #-} vary gen ((dir',v'), world ^.. posts . traverse . location) (world ^. balloon)
+    !b <- vary gen ((dir',v'), world ^.. posts . traverse . location) (world ^. balloon)
 
     return $ world & (now           .~ t')
                    . (windDirection .~ dir')
@@ -163,13 +154,8 @@ move (d, Dim -> s) (x,y) = case d of
   W  -> (x - s  , y)
   NW -> (x - s `div` 2, y + s `div` 2)
 
-convert :: Scale -> Int -> Int
-convert C = id
-convert F = round . (+20) . (*1.8) . (fromIntegral :: Int -> Double)
-convert K = round . (+273.15)      . (fromIntegral :: Int -> Double)
-
-sinkLines :: IO.Handle -> WorldS -> IO ()
-sinkLines handle (gen, world) = mapM_ observe (world ^. posts)
+sinkLines :: IO.Handle -> Gen (PrimState IO) -> World -> IO ()
+sinkLines handle gen world = mapM_ observe (world ^. posts)
   where b = world ^. balloon
         observe station
           = when ((b ^. coord) `inRange` (station ^. location)) $ do
@@ -177,11 +163,11 @@ sinkLines handle (gen, world) = mapM_ observe (world ^. posts)
               let s = mconcat
                       [ B.byteString t
                       , B.char7 '|'
-                      , B.intDec (b ^. coord . _1 . dim)
+                      , B.intDec (fromNormal (station ^. dscale) (b ^. coord . _1 . dim))
                       , B.char7 ','
-                      , B.intDec (b ^. coord . _2 . dim)
+                      , B.intDec (fromNormal (station ^. dscale) (b ^. coord . _2 . dim))
                       , B.char7 '|'
-                      , B.intDec (convert (station ^. scale) (b ^. temp))
+                      , B.intDec (fromNormal (station ^. tscale) (b ^. temp))
                       , B.char7 '|'
                       , B.byteString (station ^. name)
                       , B.char7 '\n'
@@ -195,14 +181,36 @@ defaultWorld = do
   t <- getUnixTime
   return $ World
     (Balloon (0,0) 10)
-    [ Station (200,-150) C "AU"
-    , Station (-250,100) F "US"
-    , Station (-20, 120) K "FR" ]
+    [ Station (200,-150) C KM "AU"
+    , Station (-250,100) F ML "US"
+    , Station (-20, 120) K M  "FR" ]
     t
     (S,0)
 
-initWorld :: Gen RealWorld -> IO WorldS
+initWorld :: Gen RealWorld -> IO World
 initWorld gen = do
   w     <- defaultWorld
-  world <- vary gen () w
-  return (gen, world)
+  vary gen () w
+
+-- | Writes random observations to a file.
+--   No countdown cos that's slow. Use timeout version.
+--
+writeObservations :: FilePath -> IO ()
+writeObservations path = do
+  gen   <- createSystemRandom
+  out   <- IO.openFile path IO.WriteMode
+  IO.hSetBuffering out IO.NoBuffering
+  w     <- initWorld gen
+  go out gen w
+  where go out g w = do
+          w' <- vary g () w
+          sinkLines out g w'
+          go out g w'
+
+writeObservationsForSecs :: Int -> FilePath -> IO ()
+writeObservationsForSecs n path = void $ timeout (n * 1000000) (writeObservations path)
+
+main :: IO ()
+main = do
+  t:f:_ <- getArgs
+  writeObservationsForSecs (read t) f

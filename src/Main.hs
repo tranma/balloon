@@ -17,11 +17,9 @@ import           Pipes.Lift
 import qualified Pipes.Prelude              as PP
 
 import           Bucket
-import           Random
 import           Source
 
-import           Debug.Trace
-
+chunkSize :: Int
 chunkSize = 1024
 
 type Mean = (Int, Int)
@@ -73,9 +71,10 @@ mean x (s, c) = (s + x, c + 1)
 count :: (Num v, Ord k) => k -> Map k v -> Map k v
 count k = M.insertWith (+) k 1
 
+main :: IO ()
 main = do
   caps <- getNumCapabilities
-  putStrLn $ "running on " ++ show caps ++ " threads"
+  putStrLn $ "running on " <> show caps <> " threads"
 
   buckets <- if caps > 1
              then splitFile caps "samples"
@@ -86,18 +85,3 @@ main = do
 
   stats <- mapM wait threads
   print $ mconcat stats
-
-{-
-main = do
-  gen   <- createSystemRandom
-  out   <- flip IO.openFile IO.WriteMode =<< head <$> getArgs
-  IO.hSetBuffering out IO.NoBuffering
-  (_,w) <- initWorld gen
-  sinkLines out (gen,w)
-  go out gen w
-  where go out g w = do
-          w' <- vary g () w
-          sinkLines out (g,w')
-          go out g w'
-
--}
